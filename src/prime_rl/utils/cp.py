@@ -44,7 +44,10 @@ def setup_context_parallel(model: nn.Module, config: ModelConfig, parallel_dims:
     if config.cp_style == "ring":
         # Delayed imports: both modules live under trainer.models, which imports back into
         # prime_rl.utils — a top-level import would deadlock at startup.
-        from prime_rl.trainer.models.layers.attn import substitute_ring_attn
+        from prime_rl.trainer.models.layers.attn import FlashAttention, substitute_ring_attn
+
+        if any(isinstance(module, FlashAttention) and not module.is_causal for module in model.modules()):
+            raise ValueError("Ring context parallelism supports causal attention only; use cp_style = 'ulysses'")
 
         substitute_ring_attn(cp_group, heads_k_stride=1, attn_impl=config.attn)
     elif config.cp_style == "ulysses":
