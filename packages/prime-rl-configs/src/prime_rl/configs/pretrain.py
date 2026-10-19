@@ -45,6 +45,16 @@ class MoEBalanceConfig(BaseConfig):
     included), estimated per micro-batch and averaged over the micro-batches and ranks; no rate. Marin found it works
     best on the router logits (``router_bias_on_logits`` in the model config)."""
 
+    quantile_estimator: Literal["micro_batch_mean", "histogram"] = "micro_batch_mean"
+    """How ``quantile`` estimates the thresholds. ``micro_batch_mean``: each micro-batch's exact quantile, averaged over
+    the micro-batches and ranks. ``histogram`` (Kimi K3 report, §2.3.3): per expert, a histogram of the step's margins
+    summed over the micro-batches and ranks (one all-reduce per step), read with in-bin interpolation; the quantile of
+    the pooled step, independent of how the tokens are split. Its grid is the previous step's global margin range
+    (``[-1, 1]`` on the first step after a start or resume)."""
+
+    quantile_bins: int = Field(1024, ge=2)
+    """Bins of the ``histogram`` estimator's grid."""
+
     bias_update_rate: float = Field(3e-3, ge=0)
     """Step size of the sign update (gamma): every step, each layer's bias moves by this towards underloaded experts,
     mean-centred. 0 turns the update off."""
