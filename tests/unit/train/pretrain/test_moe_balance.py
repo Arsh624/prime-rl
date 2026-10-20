@@ -68,6 +68,12 @@ def test_histogram_quantile_balancing_balances_the_recorded_batch_however_it_is_
             router(part)
         hists.append(router.quantile_hist)
     torch.testing.assert_close(hists[0], hists[1])
+    # Each token counts once per expert, in the bin of its required bias.
+    biased = router.gate(x) + router.selection_bias
+    required = biased.topk(router.top_k + 1, dim=1).values[:, -1:] - router.gate(x)
+    bins = ((required + 4.0) * (1024 / 8.0)).floor().clamp(0, 1023).long()
+    expected = torch.stack([torch.bincount(bins[:, j], minlength=1024) for j in range(8)]).float()
+    torch.testing.assert_close(hists[0], expected)
 
     # One update brings every expert, null experts included, close to 400 * 2 / 8 = 100 tokens.
     router.selection_bias.copy_(histogram_quantile_biases(hists[0], router.quantile_grid, router.top_k))

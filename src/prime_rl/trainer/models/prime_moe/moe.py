@@ -89,7 +89,10 @@ class PrimeRouter(TokenChoiceTopKRouter):
         lo, hi = self.quantile_grid
         index = ((required - lo) * (bins / (hi - lo))).floor().clamp_(0, bins - 1).long()
         index += torch.arange(num_experts, device=index.device) * bins
-        self.quantile_hist.view(-1).add_(torch.bincount(index.view(-1), minlength=num_experts * bins))
+        # scatter_add_ instead of bincount: CUDA bincount reads its input's maximum to the host, one sync per call.
+        self.quantile_hist.view(-1).scatter_add_(
+            0, index.view(-1), torch.ones_like(index.view(-1), dtype=self.quantile_hist.dtype)
+        )
         self.quantile_range[0] = torch.minimum(self.quantile_range[0], required.min())
         self.quantile_range[1] = torch.maximum(self.quantile_range[1], required.max())
 
