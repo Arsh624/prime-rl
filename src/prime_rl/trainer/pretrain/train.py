@@ -32,6 +32,7 @@ from prime_rl.trainer.optim import setup_optimizer
 from prime_rl.trainer.parallel_dims import get_parallel_dims, resolve_ep
 from prime_rl.trainer.perf import get_perf_counter
 from prime_rl.trainer.models.init import multipliers, param_role
+from prime_rl.trainer.models.prime_moe.moe import histogram_quantile_biases
 from prime_rl.trainer.pretrain.parametrization import param_groups
 from prime_rl.trainer.pretrain.bytes import token_byte_lengths
 from prime_rl.trainer.pretrain.data import (
@@ -108,6 +109,28 @@ def quantile_update_selection_biases(model: nn.Module, group: dist.ProcessGroup)
         router.selection_bias.copy_(thresholds.mean() - thresholds)
         router.quantile_sum.zero_()
         router.quantile_count.zero_()
+
+
+@torch.no_grad()
+def histogram_quantile_update_selection_biases(model: nn.Module, group: dist.ProcessGroup) -> dict[str, float]:
+    """Quantile balancing with the histogram estimator: sum the step's histograms over the ranks, set each layer's
+    selection bias from them (``histogram_quantile_biases``) and use the step's global range of the required biases
+    as the next step's grid. Returns the grid's mean bin width and the share of values in its edge bins, which also
+    hold the values outside it."""
+    routers = [moe.router for moe in iter_moe_blocks(model)]
+    hists = torch.stack([router.quantile_hist for router in routers])
+    dist.all_reduce(hists, group=group)
+    ranges = torch.stack([torch.stack([-router.quantile_range[0], router.quantile_range[1]]) for router in routers])
+    dist.all_reduce(ranges, op=dist.ReduceOp.MAX, group=group)
+    bin_width = clamped = 0.0
+    for router, hist, (neg_lo, hi) in zip(routers, hists, ranges):
+        router.selection_bias.copy_(histogram_quantile_biases(hist, router.quantile_grid, router.top_k))
+        bin_width += ((router.quantile_grid[1] - router.quantile_grid[0]) / hist.shape[1]).item()
+        clamped += ((hist[:, 0].sum() + hist[:, -1].sum()) / hist.sum()).item()
+        router.quantile_grid = torch.stack([-neg_lo, torch.maximum(hi, -neg_lo + 1e-6)])
+        router.quantile_hist.zero_()
+        router.quantile_range.copy_(torch.tensor([float("inf"), float("-inf")]))
+    return {"router/qb/bin_width": bin_width / len(routers), "router/qb/edge_share": clamped / len(routers)}
 
 
 def count_parameters(model: nn.Module) -> dict[str, int]:
@@ -271,6 +294,12 @@ def train(config: PretrainConfig):
         moe.router.quantile_sum.zero_()
         moe.router.quantile_count.zero_()
         moe.router.quantile_balance = balance.bias_update == "quantile"
+        if moe.router.quantile_balance and balance.quantile_estimator == "histogram":
+            device = moe.router.selection_bias.device
+            moe.router.quantile_hist = torch.zeros(moe.router.num_experts, balance.quantile_bins, device=device)
+            # The first step's grid; later steps use the previous step's global range.
+            moe.router.quantile_grid = torch.tensor([-1.0, 1.0], device=device)
+            moe.router.quantile_range = torch.tensor([float("inf"), float("-inf")], device=device)
     moes_with_seq_balance = list(iter_moe_blocks(model)) if balance.seq_aux_coeff > 0 else []
     for moe in moes_with_seq_balance:
         # A micro-batch is `micro_batch_size` packed rows concatenated into one sample; the sequences are the rows.
@@ -377,6 +406,16 @@ def train(config: PretrainConfig):
         run_val(step=0)
     if config.evals is not None and config.evals.eval_on_start:
         run_suite(step=checkpoint_step or 0)
+    if checkpoint_step == config.max_steps:
+        # The last step's checkpoint is written before its val and evals: resuming from it only runs those.
+        logger.info(f"Resuming from the last step ({checkpoint_step}): running its val and evals only")
+        if config.val is not None:
+            run_val(checkpoint_step)
+        if config.evals is not None and not config.evals.eval_on_start:
+            run_suite(checkpoint_step)
+        logger.success("Pretrain trainer finished")
+        asyncio.run(monitors.finalize())
+        return
 
     gc_handler = GarbageCollection(config.gc.interval) if config.gc else None
     max_memory = torch.cuda.mem_get_info()[1] / 1024**3
@@ -414,7 +453,9 @@ def train(config: PretrainConfig):
             updates_bias = balance.bias_update == "quantile" or balance.bias_update_rate > 0
             if updates_bias and progress.step <= bias_freeze_step:
                 previous_biases = [bias.clone() for bias in biases]
-                if balance.bias_update == "quantile":
+                if balance.bias_update == "quantile" and balance.quantile_estimator == "histogram":
+                    moe_metrics.update(histogram_quantile_update_selection_biases(model, dp_cp_group))
+                elif balance.bias_update == "quantile":
                     quantile_update_selection_biases(model, dp_cp_group)
                 else:
                     update_selection_biases(model, result.tokens_per_expert, balance.bias_update_rate)
@@ -457,10 +498,18 @@ def train(config: PretrainConfig):
             "perf/peak_memory/mean": peak_memory["sum"].item() / dist.get_world_size(dp_cp_group),
         }
 
-        # The last step's checkpoint is written once after the loop.
+        num_tokens = result.num_tokens
+        progress.total_tokens += num_tokens
+        step_tokens = source_tokens(train_dataset, next_window, next_window + config.data.batch_size)
+        next_window += config.data.batch_size
+        for name, tokens in step_tokens.items():
+            source_totals[name] += tokens
+        progress.total_samples = next_window
+
+        # The last step's checkpoint is written before its val and evals, so a timeout there does not lose it.
         save_ckpt_time = 0.0
         disk_metrics = {}
-        if config.ckpt and config.ckpt.interval and progress.step % config.ckpt.interval == 0 and not is_last_step:
+        if config.ckpt and (is_last_step or (config.ckpt.interval and progress.step % config.ckpt.interval == 0)):
             save_ckpt_start_time = time.perf_counter()
             ckpt_manager.save(progress.step, model, [optimizer], scheduler, progress, dataloader=dataloader)
             ckpt_manager.maybe_clean()
@@ -474,13 +523,6 @@ def train(config: PretrainConfig):
             run_suite(progress.step)
         eval_time = time.perf_counter() - eval_start_time
 
-        num_tokens = result.num_tokens
-        progress.total_tokens += num_tokens
-        step_tokens = source_tokens(train_dataset, next_window, next_window + config.data.batch_size)
-        next_window += config.data.batch_size
-        for name, tokens in step_tokens.items():
-            source_totals[name] += tokens
-        progress.total_samples = next_window
         step_time = time.perf_counter() - step_start_time - eval_time
         perf_counter = get_perf_counter(model, config.data.seq_len)
         perf_counter.count_tokens(num_tokens)
@@ -536,10 +578,6 @@ def train(config: PretrainConfig):
             break
         progress.step += 1
 
-    if config.ckpt is not None:
-        logger.info(f"Saving final checkpoint at step {progress.step}")
-        ckpt_manager.save(progress.step, model, [optimizer], scheduler, progress, dataloader=dataloader)
-        ckpt_manager.maybe_clean()
     logger.success("Pretrain trainer finished")
     asyncio.run(monitors.finalize())
 
