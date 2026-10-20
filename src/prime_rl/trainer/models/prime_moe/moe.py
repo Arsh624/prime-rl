@@ -239,10 +239,12 @@ class PrimeMoE(MoE):
         self.token_dispatcher = token_dispatcher
 
     def forward(
-        self, x: torch.Tensor | tuple[torch.Tensor, torch.Tensor], routed_experts: torch.Tensor | None = None
+        self, x: torch.Tensor | tuple[torch.Tensor, ...], routed_experts: torch.Tensor | None = None
     ) -> torch.Tensor:
         assert routed_experts is None, "PrimeMoE does not support router replay"
-        router_input, x = x if isinstance(x, tuple) else (x, x)
+        # Gated Residual reads: (router, experts) or (router, routed experts, shared experts).
+        reads = x if isinstance(x, tuple) else (x,)
+        router_input, x, shared_input = reads[0], reads[min(1, len(reads) - 1)], reads[-1]
         bs, slen, dim = x.shape
         x = x.view(-1, dim)
         top_scores, selected_experts_indices, num_tokens_per_expert, routing_confidence_sum, scores = self.router(
@@ -286,7 +288,7 @@ class PrimeMoE(MoE):
                 score_before_experts=self.score_before_experts,
             )
 
-        shared_output = self.shared_expert(x) if self.shared_expert is not None else None
+        shared_output = self.shared_expert(shared_input) if self.shared_expert is not None else None
         self.token_dispatcher.synchronize()
         routed_output = self.prepare_expert_output(routed_output)
         if shared_output is not None:
