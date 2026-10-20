@@ -140,6 +140,12 @@ class TokenShards:
             row_starts = np.arange(rows + 1, dtype=np.int64) * seq_len
         else:
             prefix_lens = self.prefix_lens if order is None else self.prefix_lens[order]
+            if self.metadata.drop:
+                keep = (
+                    np.random.default_rng([*(self.seed or [0]), epoch, 2]).random(len(prefix_lens))
+                    >= self.metadata.drop
+                )
+                prefix_lens = prefix_lens * keep
             if prefix_lens.max() >= seq_len:
                 raise ValueError(f"A metadata prefix of {prefix_lens.max()} tokens does not fit in seq_len={seq_len}")
             ends = np.cumsum(lens + prefix_lens)

@@ -107,6 +107,18 @@ def test_metadata_ends_at_its_row(tmp_path):
     assert all(prefixed[:6]) and not any(prefixed[6:])
 
 
+def test_metadata_drop_leaves_a_share_of_documents_plain(tmp_path):
+    docs = [[100 + i, 101 + i, 102 + i] for i in range(0, 600, 3)]
+    write_shard(tmp_path / "a" / "00.ds", docs)
+    write_sidecar(tmp_path / "meta" / "00.domain.ds", [[1]] * len(docs))
+    config = TokenSourceConfig(path=tmp_path / "a", metadata=tmp_path / "meta")
+    shards = TokenShards(config, seed=(0, "a"), metadata=MetadataConfig(fields=["domain"], drop=0.5))
+    assert 0.35 < (shards.epoch_layout(0, 0, 6).prefix_lens > 0).mean() < 0.65
+    tokens = np.concatenate([shards.row(index, 6)["tokens"][:-1] for index in range(shards.epoch_rows[0])])
+    content = tokens[tokens >= 100]
+    assert len(content) == len(set(content.tolist()))  # every content token at most once
+
+
 def test_token_dataset_resumes_and_continues_each_source(tmp_path):
     write_shard(tmp_path / "a" / "00.ds", [list(range(100, 200))])
     write_shard(tmp_path / "b" / "00.ds", [list(range(200, 300))])

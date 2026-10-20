@@ -232,6 +232,10 @@ def train(config: PretrainConfig):
     val_sources = {}
     if config.val is not None:
         val_sources = {name: TokenShards(source) for name, source in config.val.sources.items()}
+        if config.val.metadata is not None:
+            for name, source in config.val.sources.items():
+                if source.metadata is not None:
+                    val_sources[f"{name}+meta"] = TokenShards(source, metadata=config.val.metadata)
         check_eos(val_sources, tokenizer.eos_token_id)
         byte_lengths = token_byte_lengths(tokenizer).to("cuda")
         # Whole micro-batches on every data-parallel rank, as every forward is a collective.
@@ -354,8 +358,9 @@ def train(config: PretrainConfig):
             totals = torch.zeros(3, dtype=torch.float64, device="cuda")  # loss sum, tokens, bytes
             for micro_batch in setup_dataloader(val_dataset, config.data.micro_batch_size, num_workers=1):
                 loss_sum, token_count, _ = compute_loss(micro_batch)
-                # The bytes are counted on the unsharded targets, so every CP rank counts them once.
-                num_bytes = byte_lengths[micro_batch["target_ids"].to("cuda")].sum() / cp_size
+                # The bytes are counted on the unsharded targets with loss, so every CP rank counts them once.
+                targets = micro_batch["target_ids"].to("cuda")
+                num_bytes = (byte_lengths[targets] * micro_batch["loss_mask"].to("cuda")).sum() / cp_size
                 totals += torch.stack([loss_sum.double(), token_count.double(), num_bytes.double()])
             dist.all_reduce(totals, op=dist.ReduceOp.SUM, group=dp_cp_group)
             loss_sum, num_tokens, num_bytes = totals.tolist()

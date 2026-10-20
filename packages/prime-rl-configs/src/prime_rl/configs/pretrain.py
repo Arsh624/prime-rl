@@ -137,6 +137,9 @@ class MetadataConfig(BaseConfig):
     end_step: int | None = Field(None, ge=1)
     """First step without prefixes (a metadata-free end, as MeCo's cooldown)."""
 
+    drop: float = Field(0.0, ge=0, lt=1)
+    """Share of documents without a prefix, drawn anew for every document in every epoch."""
+
 
 class TokensDataConfig(BaseBatchConfig):
     """Rows of pre-tokenized datatrove shards, each row drawn from one source of a weighted mixture."""
@@ -186,6 +189,10 @@ class ValConfig(BaseConfig):
     sources: dict[str, TokenSourceConfig]
     """Held-out sources by name, logged as ``val/<name>/loss``, ``/ppl`` and ``/bpb``. Each eval reads the same
     windows: as many as fill whole micro-batches on every data-parallel rank."""
+
+    metadata: MetadataConfig | None = None
+    """Also evaluate every source with a metadata sidecar with these prefixes (loss and bytes on the content tokens
+    only), logged as ``val/<name>+meta/...``."""
 
 
 class EvalsConfig(BaseConfig):

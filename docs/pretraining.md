@@ -133,7 +133,7 @@ web = { path = "data/web" }
 code = { path = "data/code" }
 ```
 
-**Metadata prefixes (`[data.metadata]`).** With a per-document sidecar per source (`metadata = <folder>`: for every `<name>.ds` a `<name>.<field>.ds` with each document's prefix tokens, e.g. `URL: en.wikipedia.org\n\n`, and its `.ds.index`, one entry per document), every row piece of a document starts with the tokens of its `fields`. The prefix is in the document's attention segment and carries no loss. `epochs` limits the prefixes to some epochs, and `end_step` drops them from that step on. Packing with prefixes is sequential and takes a few seconds per epoch for millions of rows.
+**Metadata prefixes (`[data.metadata]`).** With a per-document sidecar per source (`metadata = <folder>`: for every `<name>.ds` a `<name>.<field>.ds` with each document's prefix tokens, e.g. `URL: en.wikipedia.org\n\n`, and its `.ds.index`, one entry per document), every row piece of a document starts with the tokens of its `fields`. The prefix is in the document's attention segment and carries no loss. `epochs` limits the prefixes to some epochs, `end_step` drops them from that step on, and `drop` leaves a random share of documents without a prefix in every epoch. `val.metadata` also scores every val source that has a sidecar with prefixes (`val/<name>+meta/*`, loss and bytes on the content tokens only). Packing with prefixes is sequential and takes a few seconds per epoch for millions of rows.
 
 ```toml
 [data.sources]
