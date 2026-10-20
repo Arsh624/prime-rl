@@ -113,7 +113,7 @@ The metrics are `expert_load/*` (global balance of the step), `loss/seq_balance`
 
 ## Data
 
-`data.type = "tokens"` reads [datatrove](https://github.com/huggingface/datatrove) `DocumentTokenizer` output: per source, a folder of `*.ds` token files with their `.ds.index` (document ends) and `.ds.metadata`. The files of a source are read as one stream. Each epoch reads every row of a source once, in a random order over the whole source and from a random start offset, both drawn from `data.seed`, the source and the epoch (the last `seq_len` tokens or fewer of an epoch are skipped). So every epoch has a new order and new row boundaries, and part of an epoch is a sample of the whole source, whatever the order of the files. Every row is a random read (about 33 ms each from a cold cache on CephFS); at the screening shapes, `data.num_workers = 2` with the default prefetch hides this (`time/data` stays at 0). Check `time/data` on other storage. Documents continue across rows, and attention restarts at every document and every row. Held-out sources are read in file-name order. Every document must end with the tokenizer's EOS; the trainer checks the first document of every source, which catches shards made with another tokenizer.
+`data.type = "tokens"` reads [datatrove](https://github.com/huggingface/datatrove) `DocumentTokenizer` output: per source, a folder of `*.ds` token files with their `.ds.index` (document ends) and `.ds.metadata`. Each epoch packs all documents of a source back to back into rows of `seq_len` tokens, in a random document order drawn from `data.seed`, the source and the epoch; a document that does not fit continues in the next row, and the last partial row of an epoch is skipped. The rows of an epoch are read in a random order, so the pieces of a long document are spread over the epoch. So every epoch packs the documents anew, and part of an epoch is a sample of the whole source, whatever the order of the files. Attention restarts at every document and every row. A row reads every document piece in it (about 7 reads per 8k row of web text, from a thread pool); on cold CephFS one dataloader worker reads ~45 such rows/s, so at the screening shapes `data.num_workers = 2` keeps `time/data` at 0. Check `time/data` on other storage. Held-out sources are read in file-name order, as one token stream. Every document must end with the tokenizer's EOS; the trainer checks the first document of every source, which catches shards made with another tokenizer.
 
 Each row comes from one source, drawn with the mixture `data.weights`. At startup the trainer computes how many passes over each source the run makes and fails above `data.max_epochs`.
 
@@ -129,6 +129,17 @@ weights = { web = 0.8, code = 0.2 }
 [data.sources]
 web = { path = "data/web" }
 code = { path = "data/code" }
+```
+
+**Metadata prefixes (`[data.metadata]`).** With a per-document sidecar per source (`metadata = <folder>`: for every `<name>.ds` a `<name>.<field>.ds` with each document's prefix tokens, e.g. `URL: en.wikipedia.org\n\n`, and its `.ds.index`, one entry per document), every row piece of a document starts with the tokens of its `fields`. The prefix is in the document's attention segment and carries no loss. `epochs` limits the prefixes to some epochs, and `end_step` drops them from that step on. Packing with prefixes is sequential and takes a few seconds per epoch for millions of rows.
+
+```toml
+[data.sources]
+web = { path = "data/web", metadata = "data/web-meta" }
+
+[data.metadata]
+fields = ["domain"]
+end_step = 7373
 ```
 
 Batch sizes are in tokens, so changing `seq_len` keeps the tokens per step and the number of steps. Resume restores the data position on the same GPU layout and `data.num_workers`; resuming on a different layout is not supported yet. `data.type = "fake"` trains on random tokens, for smoke and throughput tests.

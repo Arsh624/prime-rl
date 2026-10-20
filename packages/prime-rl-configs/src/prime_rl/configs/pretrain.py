@@ -62,10 +62,15 @@ class PretrainModelConfig(ModelConfig):
 
 class TokenSourceConfig(BaseConfig):
     path: Path
-    """Folder of datatrove tokenized shards: ``*.ds`` token files, each with its ``.ds.index`` and ``.ds.metadata``. The files are read in name order as one token stream."""
+    """Folder of datatrove tokenized shards: ``*.ds`` token files, each with its ``.ds.index`` and ``.ds.metadata``. The files are read in name order as one stream of documents."""
 
     max_tokens: int | None = Field(None, ge=1)
-    """Tokens available from this source: the first ``max_tokens`` of its stream. Defaults to all tokens in the shards."""
+    """Tokens available from this source: the documents that end within the first ``max_tokens`` tokens of its stream. Defaults to all documents in the shards."""
+
+    metadata: Path | None = None
+    """Folder of the per-document metadata sidecar (``data.metadata``): for every ``<name>.ds``, one
+    ``<name>.<field>.ds`` per field with the field's prefix tokens (uint32, nothing for a document without the field)
+    and its ``.ds.index`` (uint64 end offsets, one per document of the shard)."""
 
 
 class BaseBatchConfig(BaseConfig):
@@ -109,6 +114,20 @@ class FakeDataConfig(BaseBatchConfig):
     type: Literal["fake"] = "fake"
 
 
+class MetadataConfig(BaseConfig):
+    """A metadata prefix before every row piece of a document (e.g. ``URL: en.wikipedia.org``), read from the
+    sources' sidecars. It is in the document's attention segment and carries no loss."""
+
+    fields: list[str] = Field(min_length=1)
+    """Sidecar fields to prefix, in this order (e.g. ``["domain"]``)."""
+
+    epochs: list[int] | None = None
+    """Epochs (0-based, per source) with prefixes. Defaults to all."""
+
+    end_step: int | None = Field(None, ge=1)
+    """First step without prefixes (a metadata-free end, as MeCo's cooldown)."""
+
+
 class TokensDataConfig(BaseBatchConfig):
     """Rows of pre-tokenized datatrove shards, each row drawn from one source of a weighted mixture."""
 
@@ -122,6 +141,16 @@ class TokensDataConfig(BaseBatchConfig):
 
     max_epochs: float = Field(1.0, gt=0)
     """Most passes over a source's available tokens that the run (``max_steps``) may make. Checked at startup."""
+
+    metadata: MetadataConfig | None = None
+    """Metadata prefixes from the sources' sidecars. Off by default."""
+
+    @model_validator(mode="after")
+    def validate_metadata(self):
+        if self.metadata is not None:
+            if missing := [name for name, source in self.sources.items() if source.metadata is None]:
+                raise ValueError(f"data.metadata needs a metadata sidecar for every source, missing for {missing}")
+        return self
 
     @model_validator(mode="after")
     def validate_weights(self):
