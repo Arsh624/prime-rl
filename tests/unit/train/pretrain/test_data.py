@@ -119,6 +119,36 @@ def test_metadata_drop_leaves_a_share_of_documents_plain(tmp_path):
     assert len(content) == len(set(content.tolist()))  # every content token at most once
 
 
+def test_metadata_field_sampling(tmp_path):
+    docs = [list(range(100 + 50 * i, 100 + 50 * i + length)) for i, length in enumerate([40] * 100 + [10] * 100)]
+    write_shard(tmp_path / "a" / "00.ds", docs)
+    write_sidecar(tmp_path / "meta" / "00.domain.ds", [[1, 1]] * len(docs))
+    write_sidecar(tmp_path / "meta" / "00.date.ds", [[2, 2]] * len(docs))
+    config = TokenSourceConfig(path=tmp_path / "a", metadata=tmp_path / "meta")
+
+    # Length-scaled: within 10% of a 40-token document fit both fields (4 tokens), of a 10-token document none.
+    shards = TokenShards(config, metadata=MetadataConfig(fields=["domain", "date"], max_share=0.1))
+    prefix_lens, _ = shards.epoch_prefixes(0)
+    assert (prefix_lens == [4] * 100 + [0] * 100).all()
+    rows = range(shards.locate(0, 50) and shards.epoch_rows[0])
+    tokens = [token for index in rows for token in shards.row(index, 50)["tokens"][:-1]]
+    assert tokens[:6] == [1, 1, 2, 2, 100, 101]
+    assert tokens[tokens.index(docs[150][0]) - 1] not in (1, 2)
+
+    # Random subsets: each field in about half of the prefixes, read where the layout put it.
+    shards = TokenShards(config, seed=(0, "a"), metadata=MetadataConfig(fields=["domain", "date"], field_keep=0.5))
+    prefix_lens, field_mask = shards.epoch_prefixes(0)
+    assert 0.35 < (field_mask & 1).mean() < 0.65 and 0.35 < (field_mask >> 1 & 1).mean() < 0.65
+    assert (prefix_lens == 2 * (field_mask & 1) + 2 * (field_mask >> 1 & 1)).all()
+    content = [
+        t
+        for index in range(shards.locate(0, 50) and shards.epoch_rows[0])
+        for t in shards.row(index, 50)["tokens"][:-1]
+        if t >= 100
+    ]
+    assert len(content) == len(set(content))
+
+
 def test_token_dataset_resumes_and_continues_each_source(tmp_path):
     write_shard(tmp_path / "a" / "00.ds", [list(range(100, 200))])
     write_shard(tmp_path / "b" / "00.ds", [list(range(200, 300))])

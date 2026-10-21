@@ -65,6 +65,8 @@ class EpochLayout:
     row_starts: np.ndarray
     read_order: np.ndarray | None
     """The rows in reading order (None: in order)."""
+    field_mask: np.ndarray | None = None
+    """The fields in each document's prefix (file order; bit ``i`` = field ``i``; None: all fields)."""
 
 
 class TokenShards:
@@ -134,18 +136,14 @@ class TokenShards:
             switch_row = self.prefix_end_row - rows_before
             prefixed = switch_row > 0
         if not prefixed:
-            prefix_lens = None
+            prefix_lens = field_mask = None
             ends = np.cumsum(lens)
             rows = (int(ends[-1]) - 1) // seq_len
             row_starts = np.arange(rows + 1, dtype=np.int64) * seq_len
         else:
-            prefix_lens = self.prefix_lens if order is None else self.prefix_lens[order]
-            if self.metadata.drop:
-                keep = (
-                    np.random.default_rng([*(self.seed or [0]), epoch, 2]).random(len(prefix_lens))
-                    >= self.metadata.drop
-                )
-                prefix_lens = prefix_lens * keep
+            prefix_lens, field_mask = self.epoch_prefixes(epoch)
+            if order is not None:
+                prefix_lens = prefix_lens[order]
             if prefix_lens.max() >= seq_len:
                 raise ValueError(f"A metadata prefix of {prefix_lens.max()} tokens does not fit in seq_len={seq_len}")
             ends = np.cumsum(lens + prefix_lens)
@@ -176,7 +174,7 @@ class TokenShards:
             read_order = np.concatenate([rng.permutation(split), split + rng.permutation(rows - split)]).astype(
                 np.uint32
             )
-        layout = EpochLayout(order, ends, prefix_lens, row_starts, read_order)
+        layout = EpochLayout(order, ends, prefix_lens, row_starts, read_order, field_mask)
         self.epoch_rows[epoch] = len(layout.row_starts) - 1
         self.layout = (epoch, layout)
         return layout
@@ -198,10 +196,31 @@ class TokenShards:
         row = index - rows_before
         return layout, row if layout.read_order is None else int(layout.read_order[row])
 
-    def prefix_reads(self, doc: int, start: int, stop: int) -> list[tuple[TokenFiles, int, int]]:
+    def epoch_prefixes(self, epoch: int) -> tuple[np.ndarray, np.ndarray | None]:
+        """Prefix tokens of every document (file order) in ``epoch`` and the fields in its prefix (bit ``i`` = field
+        ``i``; None: all fields)."""
+        metadata = self.metadata
+        rng = np.random.default_rng([*(self.seed or [0]), epoch, 2])
+        prefix_lens, field_mask = self.prefix_lens, None
+        if metadata.field_keep < 1 or metadata.max_share is not None:
+            field_lens = np.stack([np.diff(ends, prepend=0).astype(np.int32) for _, ends in self.fields], axis=1)
+            keep = rng.random(field_lens.shape) < metadata.field_keep
+            if metadata.max_share is not None:
+                keep &= np.cumsum(field_lens * keep, axis=1) <= metadata.max_share * self.doc_lens[:, None]
+            prefix_lens = (field_lens * keep).sum(axis=1)
+            field_mask = (keep << np.arange(len(self.fields))).sum(axis=1).astype(np.uint8)
+        if metadata.drop:
+            prefix_lens = prefix_lens * (rng.random(len(prefix_lens)) >= metadata.drop)
+        return prefix_lens, field_mask
+
+    def prefix_reads(
+        self, doc: int, start: int, stop: int, field_mask: np.ndarray | None
+    ) -> list[tuple[TokenFiles, int, int]]:
         """Reads of the prefix tokens ``[start, stop)`` of document ``doc``."""
         reads, offset = [], 0
-        for files, ends in self.fields:
+        for i, (files, ends) in enumerate(self.fields):
+            if field_mask is not None and not field_mask[doc] >> i & 1:
+                continue
             end = int(ends[doc])
             length = end - (int(ends[doc - 1]) if doc else 0)
             lo, hi = max(start, offset), min(stop, offset + length)
@@ -229,7 +248,8 @@ class TokenShards:
         i = int(np.searchsorted(layout.ends, start, side="right"))
         continued = seq_len - (stop - 1 - start)
         if continued:
-            add(self.prefix_reads(int(layout.order[i]) if layout.order is not None else i, 0, continued), True)
+            doc = int(layout.order[i]) if layout.order is not None else i
+            add(self.prefix_reads(doc, 0, continued, layout.field_mask), True)
             position = continued
         while start < stop:
             doc = int(layout.order[i]) if layout.order is not None else i
@@ -241,7 +261,7 @@ class TokenShards:
             end = min(stop, doc_end)
             if start < doc_start + prefix_len:
                 prefix_end = min(end, doc_start + prefix_len)
-                add(self.prefix_reads(doc, start - doc_start, prefix_end - doc_start), True)
+                add(self.prefix_reads(doc, start - doc_start, prefix_end - doc_start, layout.field_mask), True)
                 position += prefix_end - start
                 start = prefix_end
             if start < end:

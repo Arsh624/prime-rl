@@ -138,6 +138,14 @@ class MetadataConfig(BaseConfig):
     drop: float = Field(0.0, ge=0, lt=1)
     """Share of documents without a prefix, drawn anew for every document in every epoch."""
 
+    field_keep: float = Field(1.0, gt=0, le=1)
+    """Probability that a field is in a document's prefix, drawn anew for every field, document and epoch (random
+    field subsets)."""
+
+    max_share: float | None = Field(None, gt=0)
+    """Length-scaled prefixes: fields are added in order while the prefix stays within this share of the document's
+    tokens, so a document too short for the first field gets no prefix."""
+
 
 class TokensDataConfig(BaseBatchConfig):
     """Rows of pre-tokenized datatrove shards, each row drawn from one source of a weighted mixture."""
