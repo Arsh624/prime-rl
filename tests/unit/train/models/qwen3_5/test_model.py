@@ -81,6 +81,15 @@ def get_model(config, device="cuda"):
     return model
 
 
+def test_tied_word_embeddings_share_lm_head():
+    config = get_vlm_config(get_text_config())
+    config.tie_word_embeddings = True
+    with torch.device("meta"):
+        model = get_custom_vlm_cls(config).from_config(config, attn_implementation="flash_attention_2")
+    inject_prime_lm_head(model)
+    assert model.lm_head.weight is model.get_input_embeddings().weight
+
+
 @pytest.mark.gpu
 def test_context_parallel_setup_chain_text_and_vlm(text_config):
     cp_group = MagicMock()
